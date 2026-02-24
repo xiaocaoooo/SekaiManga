@@ -1,0 +1,90 @@
+name: Manga Auto Update
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  auto-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Fetch manga metadata
+        env:
+          BILIBILI_COOKIE: ${{ secrets.BILIBILI_COOKIE }}
+        run: uv run python src/get_mangas.py mangas/mangas.json
+
+      - name: Guard against invalid mangas.json
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path('mangas/mangas.json')
+          if not path.exists():
+              print('mangas/mangas.json does not exist, aborting.')
+              sys.exit(1)
+
+          try:
+              data = json.loads(path.read_text(encoding='utf-8'))
+          except Exception as exc:
+              print(f'Failed to parse mangas/mangas.json: {exc}')
+              sys.exit(1)
+
+          if not isinstance(data, dict) or not data:
+              print('mangas/mangas.json is empty or not a JSON object, aborting.')
+              sys.exit(1)
+
+          def is_valid(value):
+              if value is None:
+                  return False
+              if isinstance(value, (str, list, dict, tuple, set)):
+                  return len(value) > 0
+              return True
+
+          if not any(is_valid(v) for v in data.values()):
+              print('mangas/mangas.json has no valid entries, aborting.')
+              sys.exit(1)
+
+          print('mangas/mangas.json passed guard checks.')
+          PY
+
+      - name: Download manga images
+        run: uv run python src/download.py mangas/mangas.json
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add mangas/mangas.json
+          find mangas -maxdepth 1 -type f -name '*.png' -print0 | xargs -0r git add --
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(manga): auto update mangas [skip ci]"
+          git push
